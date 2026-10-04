@@ -9,11 +9,14 @@ Requires env vars: TRAE_ACCESS_TOKEN, TRAE_DEVICE_ID, TRAE_REGION (optional).
 import json
 import os
 import sys
+import time
 
 import requests
 
 API_BASE = "https://api.trae.cn/trae/api/v2/ug/checkin_credits"
 REQ_SOURCE = 1
+MAX_RETRIES = 3
+RETRY_DELAY = 20  # seconds
 
 
 def get_headers(token, device_id, region):
@@ -33,6 +36,55 @@ def unwrap(resp):
     return resp
 
 
+def post(path, headers, body):
+    r = requests.post(f"{API_BASE}/{path}", headers=headers, json=body, timeout=30)
+    r.raise_for_status()
+    return unwrap(r.json())
+
+
+def attempt(headers, body):
+    """One full attempt. Returns (ok, reason)."""
+    # Step 1: check status
+    try:
+        status = post("status", headers, body)
+    except Exception as e:
+        detail = ""
+        if hasattr(e, "response") and e.response is not None:
+            detail = f" | body={e.response.text[:200]}"
+        return False, f"status request failed: {e}{detail}"
+
+    print(f"  status: {json.dumps(status, ensure_ascii=False)}")
+
+    if status.get("code", 0) != 0:
+        return False, f"API error: {status.get('message', 'unknown')}"
+
+    if status.get("checked_in"):
+        return True, f"already checked in (credits={status.get('credits', '?')})"
+
+    if not status.get("enable", True):
+        return False, "check-in disabled for this account"
+
+    # Step 2: claim
+    try:
+        claim = post("claim", headers, body)
+    except Exception as e:
+        detail = ""
+        if hasattr(e, "response") and e.response is not None:
+            detail = f" | body={e.response.text[:200]}"
+        return False, f"claim request failed: {e}{detail}"
+
+    print(f"  claim: {json.dumps(claim, ensure_ascii=False)}")
+
+    if claim.get("code") == 0:
+        try:
+            after = post("status", headers, body)
+            return True, f"claimed successfully (credits={after.get('credits', '?')})"
+        except Exception:
+            return True, "claimed successfully"
+
+    return False, f"claim rejected: {claim.get('message', json.dumps(claim, ensure_ascii=False)[:200])}"
+
+
 def main():
     token = os.environ.get("TRAE_ACCESS_TOKEN")
     device_id = os.environ.get("TRAE_DEVICE_ID", "")
@@ -50,57 +102,27 @@ def main():
 
     print("=== Trae CN Auto Check-in ===")
 
-    # Step 1: check status
-    print("[1/2] Checking status...")
-    try:
-        r = requests.post(f"{API_BASE}/status", headers=headers, json=body, timeout=30)
-        r.raise_for_status()
-        status = unwrap(r.json())
-        print(f"  Response: {json.dumps(status, ensure_ascii=False)}")
-    except Exception as e:
-        print(f"Error checking status: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"  Body: {e.response.text[:300]}")
-        sys.exit(1)
+    last_reason = ""
+    for i in range(1, MAX_RETRIES + 1):
+        print(f"[Attempt {i}/{MAX_RETRIES}]")
+        try:
+            ok, reason = attempt(headers, body)
+        except Exception as e:
+            ok, reason = False, f"unexpected error: {e}"
 
-    if status.get("code", 0) != 0 and "code" in status:
-        print(f"API error: {status.get('message', 'unknown')}")
-        sys.exit(1)
+        if ok:
+            print(f"Result: {reason}")
+            print("Check-in successful!")
+            return
 
-    if status.get("checked_in"):
-        print(f"Already checked in today. Credits: {status.get('credits', '?')}")
-        return
+        last_reason = reason
+        print(f"Result: {reason}")
+        if i < MAX_RETRIES:
+            print(f"Retrying in {RETRY_DELAY}s...")
+            time.sleep(RETRY_DELAY)
 
-    if not status.get("enable", True):
-        print(f"Check-in not enabled: {json.dumps(status, ensure_ascii=False)[:200]}")
-        sys.exit(1)
-
-    # Step 2: claim credits
-    print("[2/2] Claiming credits...")
-    try:
-        r = requests.post(f"{API_BASE}/claim", headers=headers, json=body, timeout=30)
-        r.raise_for_status()
-        claim = r.json()
-        print(f"  Response: {json.dumps(claim, ensure_ascii=False)}")
-    except Exception as e:
-        print(f"Error claiming credits: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"  Body: {e.response.text[:300]}")
-        sys.exit(1)
-
-    if claim.get("code") == 0:
-        print("Check-in successful!")
-    else:
-        print(f"Check-in failed: {claim.get('message', json.dumps(claim, ensure_ascii=False)[:200])}")
-        sys.exit(1)
-
-    # Verify
-    try:
-        r = requests.post(f"{API_BASE}/status", headers=headers, json=body, timeout=30)
-        after = unwrap(r.json())
-        print(f"Current credits: {after.get('credits', '?')}")
-    except Exception:
-        pass
+    print(f"Check-in failed after {MAX_RETRIES} attempts: {last_reason}")
+    sys.exit(1)
 
 
 if __name__ == "__main__":
